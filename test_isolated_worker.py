@@ -222,6 +222,16 @@ class IsolatedWorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(WorkerRejected, "sandbox unavailable"):
                 transform_document(COPY_INPUT, b"")
 
+    def test_unsupported_python_never_starts_worker(self):
+        with patch("isolated_worker.subprocess.Popen") as spawn:
+            with patch("isolated_worker.sys.version_info", (3, 12, 10)):
+                with self.assertRaisesRegex(WorkerRejected, "Python 3.13 or later"):
+                    transform_document(COPY_INPUT, b"")
+            with patch("isolated_worker.os.waitid", None):
+                with self.assertRaisesRegex(WorkerRejected, "requires os.waitid"):
+                    transform_document(COPY_INPUT, b"")
+        spawn.assert_not_called()
+
     def test_parent_caps_worker_output_and_time(self):
         with TemporaryDirectory() as directory:
             script = Path(directory) / "worker.py"

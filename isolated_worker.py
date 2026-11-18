@@ -98,6 +98,12 @@ def _exchange(child: subprocess.Popen, request: bytes) -> bytes:
 def transform_document(wasm: bytes, document: bytes) -> bytes:
     if sys.platform != "darwin":
         raise WorkerRejected("OS sandbox unavailable on this platform")
+    if sys.version_info < (3, 13):
+        raise WorkerRejected("macOS worker requires Python 3.13 or later")
+    if not callable(getattr(os, "waitid", None)) or not all(
+        hasattr(os, name) for name in ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT", "CLD_EXITED")
+    ):
+        raise WorkerRejected("macOS worker requires os.waitid with unreaped exit status support")
     if (
         not isinstance(wasm, bytes)
         or len(wasm) > MAX_MODULE_BYTES

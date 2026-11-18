@@ -6,10 +6,12 @@ There are no WASI, network, file, storage, publish, or revoke imports. The host 
 
 The guest exports fixed two-page 32-bit memory and a function called transform. The function takes the input length, output offset, and output capacity as i32 values and returns the output length as i32. Input starts at offset zero. Output starts at offset 65,536. Modules are limited to 128 KiB. Input and output are each limited to 64 KiB. There is one instance, one linear memory, no tables, and one million units of Wasmtime fuel, including any start function.
 
-Run the standalone tests in a trusted local macOS shell with a virtual environment. The SQLite coordinator is optional for running this PR's tests.
+The worker requires Python 3.13 or later on macOS, with `os.waitid` and `WNOWAIT` support for observing exit without reaping the process-group leader. Unsupported runtimes reject the job before starting a subprocess. The Python minimum for the separate SQLite coordinator is unchanged.
+
+Run the standalone tests in a trusted local macOS shell with a virtual environment. The SQLite coordinator is optional for these tests.
 
 ~~~sh
-python3 -m venv /path/to/worker-venv
+python3.13 -m venv /path/to/worker-venv
 /path/to/worker-venv/bin/python -m pip install -r worker-requirements.txt
 /path/to/worker-venv/bin/python -B -m unittest -v test_isolated_worker
 ~~~
