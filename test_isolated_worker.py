@@ -3,13 +3,14 @@ import socket
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from time import sleep
 import unittest
 from unittest.mock import Mock, patch
 
 import wasmtime
 
 from isolated_worker import (
-    MAX_INPUT_BYTES, MAX_MODULE_BYTES, WorkerRejected, transform_and_stage,
+    FRAME, MAX_INPUT_BYTES, MAX_MODULE_BYTES, WorkerRejected, transform_and_stage,
     transform_document, WORKER_SCRIPT,
 )
 
@@ -30,6 +31,7 @@ COPY_INPUT = worker("local.get $output i32.const 0 local.get $size memory.copy l
 
 OS_PROBE = """
 import errno
+import os
 from pathlib import Path
 import runpy
 import socket
@@ -51,6 +53,16 @@ def datagram():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
         sender.sendto(b"probe", ("127.0.0.1", port))
 
+def fork():
+    child = os.fork()
+    if child == 0:
+        os._exit(0)
+    assert os.waitpid(child, 0)[1] == 0
+
+def spawn():
+    child = os.posix_spawn("/usr/bin/true", ["true"], {})
+    assert os.waitpid(child, 0)[1] == 0
+
 write_target = Path(write_target)
 fixture = Path(fixture)
 assert fixture.read_bytes() == b"parent only"
@@ -59,6 +71,8 @@ write_target.unlink()
 connect()
 bind()
 datagram()
+fork()
+spawn()
 isolate()
 for operation in (
     fixture.read_bytes,
@@ -66,6 +80,8 @@ for operation in (
     connect,
     bind,
     datagram,
+    fork,
+    spawn,
 ):
     try:
         operation()
@@ -73,7 +89,40 @@ for operation in (
         assert error.errno in (errno.EACCES, errno.EPERM), error
     else:
         raise AssertionError("sandbox allowed an operation")
-print("native file and network operations denied")
+print("native file, network, and process operations denied")
+"""
+
+ENTRY_PROBE = """
+import errno
+from pathlib import Path
+import runpy
+import sys
+
+script, fixture_path, mode = sys.argv[1:]
+fixture = Path(fixture_path)
+assert fixture.read_bytes() == b"parent only"
+main = runpy.run_path(script)["main"]
+entry = main.__globals__
+request = entry["_request"]
+
+def guarded_request():
+    if mode == "fail":
+        raise AssertionError("worker read a request after sandbox installation failed")
+    try:
+        fixture.read_bytes()
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM), error
+    else:
+        raise AssertionError("worker entered request handling without OS protection")
+    return request()
+
+def installation_failure():
+    raise OSError("test sandbox failure")
+
+entry["_request"] = guarded_request
+if mode == "fail":
+    entry["isolate"] = installation_failure
+sys.stdout.buffer.write(main())
 """
 
 
@@ -135,7 +184,7 @@ class IsolatedWorkerTests(unittest.TestCase):
         self.assertEqual(len(core.mock_calls), 1)
         core.stage.assert_called_once_with("job", "worker", "blob", b"document")
 
-    def test_native_os_sandbox_denies_file_and_network_access(self):
+    def test_native_os_sandbox_denies_file_network_and_process_access(self):
         with TemporaryDirectory() as directory, socket.socket() as listener:
             fixture = Path(directory) / "private"
             fixture.write_bytes(b"parent only")
@@ -149,8 +198,24 @@ class IsolatedWorkerTests(unittest.TestCase):
                 cwd="/", env={}, capture_output=True, text=True, timeout=10, close_fds=True,
             )
             self.assertEqual(child.returncode, 0, child.stderr)
-            self.assertEqual(child.stdout.strip(), "native file and network operations denied")
+            self.assertEqual(child.stdout.strip(), "native file, network, and process operations denied")
             self.assertFalse(write_target.exists())
+
+    def test_entry_applies_sandbox_before_reading_and_rejects_install_failure(self):
+        frame = FRAME.pack(len(COPY_INPUT), 3) + COPY_INPUT + b"abc"
+        with TemporaryDirectory() as directory:
+            fixture = Path(directory) / "private"
+            fixture.write_bytes(b"parent only")
+            for mode, expected in (("real", b"\x00abc"), ("fail", b"sandbox")):
+                with self.subTest(mode=mode):
+                    child = subprocess.run(
+                        [sys.executable, "-I", "-B", "-c", ENTRY_PROBE, str(WORKER_SCRIPT),
+                         str(fixture), mode],
+                        input=frame, cwd="/", env={}, capture_output=True,
+                        timeout=10, close_fds=True,
+                    )
+                    self.assertEqual(child.returncode, 0, child.stderr.decode(errors="replace"))
+                    self.assertEqual(child.stdout, expected)
 
     def test_unsupported_sandbox_fails_closed(self):
         with patch("isolated_worker.sys.platform", "unsupported"):
@@ -168,6 +233,45 @@ class IsolatedWorkerTests(unittest.TestCase):
                 with patch("isolated_worker.WORKER_TIMEOUT", 0.5):
                     with self.assertRaisesRegex(WorkerRejected, "process deadline"):
                         transform_document(COPY_INPUT, b"")
+
+    def test_parent_terminates_same_group_descendants(self):
+        with TemporaryDirectory() as directory:
+            for mode in ("success", "timeout"):
+                with self.subTest(mode=mode):
+                    folder = Path(directory) / mode
+                    folder.mkdir()
+                    script = folder / "stand_in.py"
+                    ready = folder / "ready"
+                    survived = folder / "survived"
+                    script.write_text(f"""
+import os
+from pathlib import Path
+from time import sleep
+
+ready = Path({str(ready)!r})
+pid = os.fork()
+if pid == 0:
+    os.close(0)
+    if {mode!r} == "success":
+        os.close(1)
+    ready.touch()
+    sleep(1.5)
+    Path({str(survived)!r}).touch()
+    os._exit(0)
+while not ready.exists():
+    sleep(0.01)
+os.write(1, b"\\x00")
+""")
+                    with patch("isolated_worker.WORKER_SCRIPT", script):
+                        if mode == "success":
+                            self.assertEqual(transform_document(COPY_INPUT, b""), b"")
+                        else:
+                            with patch("isolated_worker.WORKER_TIMEOUT", 0.75):
+                                with self.assertRaisesRegex(WorkerRejected, "process deadline"):
+                                    transform_document(COPY_INPUT, b"")
+                    self.assertTrue(ready.exists(), "stand-in descendant did not start")
+                    sleep(1.55)
+                    self.assertFalse(survived.exists(), "stand-in descendant survived cleanup")
 
 
 if __name__ == "__main__":

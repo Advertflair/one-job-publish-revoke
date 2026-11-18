@@ -14,7 +14,9 @@ python3 -m venv /path/to/worker-venv
 /path/to/worker-venv/bin/python -B -m unittest -v test_isolated_worker
 ~~~
 
-The native probe verifies that temporary-file reads and writes, TCP connect and bind, and UDP send work before sandboxing and fail with a permission error afterward. It uses only a temporary fixture and loopback. A sandboxed test runner may block installing a second Seatbelt policy. In that case the worker rejects rather than executing the module.
+The native probe verifies that temporary-file reads and writes, TCP connect and bind, UDP send, fork, and spawn work before sandboxing and fail with a permission error afterward. It uses only temporary fixtures, loopback, and a harmless executable. A separate test exercises the real worker entry point and asserts that file access is denied before the request is read. It also checks that an installation error prevents request handling. A sandboxed test runner may block installing a second Seatbelt policy. In that case the worker rejects rather than executing the module.
+
+Every worker starts in its own process group. The parent tears down the group before reaping the leader, including on timeout and normal exit. A stand-in child tests both paths. This cleanup is a fallback for descendants in the same group. The sandbox is still responsible for denying process creation and preventing access to host resources.
 
 This is a macOS research backend. It uses the deprecated Seatbelt library interface and deliberately rejects other platforms. It depends on a trusted Python interpreter, Wasmtime package, trusted worker script, and OS. The child has CPU, deadline, guest-memory, module-size, and pipe limits. These are not a total host-memory bound. The native probes validate the listed operations on the tested host. They do not cover every syscall or side channel. The host must authenticate callers, assign the correct input, and treat output as untrusted content.
 

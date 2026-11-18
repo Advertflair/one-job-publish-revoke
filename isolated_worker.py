@@ -1,9 +1,10 @@
 import os
 from pathlib import Path
 import selectors
+import signal
 import subprocess
 import sys
-from time import monotonic
+from time import monotonic, sleep
 from typing import TYPE_CHECKING
 
 from worker_process import (
@@ -34,6 +35,21 @@ ERRORS = {
 
 class WorkerRejected(Exception):
     pass
+
+
+def _peek_exit(child: subprocess.Popen):
+    return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+
+def _stop_group(child: subprocess.Popen) -> None:
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if _peek_exit(child) is None:
+            child.kill()
+            raise
 
 
 def _exchange(child: subprocess.Popen, request: bytes) -> bytes:
@@ -67,9 +83,16 @@ def _exchange(child: subprocess.Popen, request: bytes) -> bytes:
                         response.extend(chunk)
                         if len(response) > MAX_RESPONSE_BYTES:
                             raise WorkerRejected("worker process returned too many bytes")
-    if child.wait(timeout=max(0, deadline - monotonic())) != 0:
-        raise WorkerRejected("worker process exited unsuccessfully")
-    return bytes(response)
+    while True:
+        status = _peek_exit(child)
+        if status is not None:
+            if status.si_code != os.CLD_EXITED or status.si_status != 0:
+                raise WorkerRejected("worker process exited unsuccessfully")
+            return bytes(response)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise WorkerRejected("worker exceeded its process deadline")
+        sleep(min(remaining, 0.01))
 
 
 def transform_document(wasm: bytes, document: bytes) -> bytes:
@@ -89,15 +112,12 @@ def transform_document(wasm: bytes, document: bytes) -> bytes:
         with subprocess.Popen(
             [sys.executable, "-I", "-B", str(WORKER_SCRIPT)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            cwd="/", env={}, close_fds=True,
+            cwd="/", env={}, close_fds=True, start_new_session=True,
         ) as child:
             try:
                 response = _exchange(child, request)
             finally:
-                if child.poll() is None:
-                    child.kill()
-    except subprocess.TimeoutExpired:
-        raise WorkerRejected("worker exceeded its process deadline") from None
+                _stop_group(child)
     except OSError:
         raise WorkerRejected("worker process could not communicate") from None
 
