@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
@@ -26,6 +27,11 @@ connect = sqlite3.connect
 
 class CrashConnection(sqlite3.Connection):
     def commit(self):
+        row = self.execute(
+            "SELECT state, blob_id, digest, recipient FROM jobs WHERE job_id = 'job'"
+        ).fetchone()
+        if not self.in_transaction or tuple(row) != ("Published", "blob", digest, "recipient"):
+            raise AssertionError("crash point did not witness the intended pending publication")
         if cut == "after":
             super().commit()
         os._exit(23)
@@ -91,6 +97,29 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.read(), Reply("NotPublished"))
         self.assert_denied()
 
+    def test_worker_cannot_share_another_role(self):
+        for role in ("publisher", "revoker", "recipient"):
+            with self.subTest(role=role):
+                principals = {name: name for name in ("worker", "publisher", "revoker", "recipient")}
+                principals[role] = "worker"
+                with self.assertRaisesRegex(ValueError, "worker must be distinct"):
+                    self.core.create_job("invalid", **principals)
+                self.assertEqual(self.core.status("invalid", "recipient"), Reply("Denied"))
+
+    def test_unauthorized_writes_do_not_need_the_write_lock(self):
+        with closing(sqlite3.connect(self.database, isolation_level=None)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.assertEqual(self.core.stage("job", "outsider", "blob", PAYLOAD), Reply("Denied"))
+            self.assertEqual(self.core.publish("job", "outsider", BINDING), Reply("Denied"))
+            self.assertEqual(self.core.revoke("job", "outsider"), Reply("Denied"))
+        self.assertEqual(self.core.status("job", "recipient"), Reply("Running"))
+
+    def test_write_connection_sync_settings(self):
+        with closing(self.core._connect()) as db:
+            self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 3)
+            if sys.platform == "darwin":
+                self.assertEqual(db.execute("PRAGMA fullfsync").fetchone()[0], 1)
+
     def test_staging_is_bounded_and_immutable(self):
         self.assertEqual(self.core.stage("job", "recipient", "blob", PAYLOAD), Reply("Denied"))
         self.assertEqual(
@@ -121,17 +150,26 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(self.read(), Reply("Unavailable"))
         self.assertFalse(self.database.exists())
 
-    def crash_publish(self, cut):
-        self.seal()
-        child = subprocess.run(
+    def run_crash_child(self, cut):
+        return subprocess.run(
             [sys.executable, "-c", CRASH_CHILD, str(self.database), cut, BINDING.digest],
             cwd=Path(__file__).resolve().parent,
             capture_output=True,
             text=True,
             timeout=10,
         )
+
+    def crash_publish(self, cut):
+        self.seal()
+        child = self.run_crash_child(cut)
         self.assertEqual(child.returncode, 23, child.stdout + child.stderr)
         self.core = Coordinator(self.database)
+
+    def test_crash_probe_rejects_a_write_without_pending_publication(self):
+        child = self.run_crash_child("before")
+        self.assertNotEqual(child.returncode, 23)
+        self.assertIn("did not witness the intended pending publication", child.stderr)
+        self.assertEqual(self.core.status("job", "recipient"), Reply("Running"))
 
     def test_precommit_crash_retry_first(self):
         self.crash_publish("before")
